@@ -1,0 +1,1771 @@
+# osint_bot.py
+# Main script buat jalanin bot OSINT
+import telegram
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+import requests
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
+import config  # Import file config.py
+import re
+from urllib.parse import quote_plus
+import json
+import asyncio
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
+import socket
+import whois
+import dns.resolver
+import hashlib
+from datetime import datetime
+import threading
+from textblob import TextBlob  # Untuk analisis sentimen gratis
+import nltk  # Untuk NLP gratis
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+import pandas as pd  # Untuk analisis data
+import logging
+from telegram.error import (TelegramError, Unauthorized, BadRequest,
+                          TimedOut, ChatMigrated, NetworkError)
+import phonenumbers
+from phonenumbers import geocoder, carrier, timezone
+import ssl
+import shodan
+import censys.search
+import nmap
+import os
+
+# Fungsi untuk animasi loading
+async def update_loading_animation(message, text_prefix="🔍 Mencari", max_dots=3):
+    """Update pesan loading dengan animasi"""
+    loading_emojis = ["⏳", "⌛️", "🔍", "🔎"]
+    dots = 0
+    emoji_index = 0
+    
+    while True:
+        try:
+            dots = (dots + 1) % (max_dots + 1)
+            emoji_index = (emoji_index + 1) % len(loading_emojis)
+            loading_text = f"{loading_emojis[emoji_index]} {text_prefix}{'.' * dots}"
+            await message.edit_text(loading_text)
+            await asyncio.sleep(0.7)
+        except Exception:
+            break
+
+async def start_loading(message, text_prefix="🔍 Mencari"):
+    """Mulai animasi loading dalam task terpisah"""
+    return asyncio.create_task(update_loading_animation(message, text_prefix))
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Nonaktifkan TensorFlow Lite untuk menghindari warning
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # 0=all, 1=info, 2=warning, 3=error
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# Download NLTK data yang diperlukan
+def setup_nltk():
+    """Setup semua resource NLTK yang diperlukan"""
+    resources = [
+        'punkt',
+        'stopwords',
+        'averaged_perceptron_tagger',
+        'punkt_tab',
+        'averaged_perceptron_tagger_eng',
+        'universal_tagset'
+    ]
+    
+    for resource in resources:
+        try:
+            nltk.download(resource, quiet=True)
+        except Exception as e:
+            print(f"Warning: Gagal download resource NLTK '{resource}': {str(e)}")
+
+# Jalankan setup NLTK
+setup_nltk()
+
+# Tambahkan variabel global untuk melacak pengguna
+daily_users = set()
+last_reset_date = datetime.now().date()
+total_monthly_users = set()  # Tambah tracking bulanan
+last_monthly_reset = datetime.now().replace(day=1).date()
+
+def reset_daily_users():
+    """Reset pengguna harian pada tengah malam"""
+    global daily_users, last_reset_date, total_monthly_users, last_monthly_reset
+    current_date = datetime.now().date()
+    
+    # Reset harian
+    if current_date > last_reset_date:
+        logger.info(f"Mereset statistik harian. Total pengguna kemarin: {len(daily_users)}")
+        daily_users.clear()
+        last_reset_date = current_date
+    
+    # Reset bulanan
+    if current_date.replace(day=1) > last_monthly_reset:
+        logger.info(f"Mereset statistik bulanan. Total pengguna bulan lalu: {len(total_monthly_users)}")
+        total_monthly_users.clear()
+        last_monthly_reset = current_date.replace(day=1)
+
+def track_user(user_id, username=None):
+    """Melacak pengguna yang menggunakan bot"""
+    global daily_users, total_monthly_users
+    reset_daily_users()  # Reset jika sudah hari baru
+    
+    # Tambahkan ke statistik harian dan bulanan
+    daily_users.add(user_id)
+    total_monthly_users.add(user_id)
+    
+    # Log aktivitas pengguna
+    user_info = f"ID: {user_id}"
+    if username:
+        user_info += f", Username: @{username}"
+    logger.info(f"Pengguna baru menggunakan bot - {user_info}")
+
+def start(update, context):
+    # Track user saat menggunakan command start
+    track_user(update.effective_user.id, update.effective_user.username)
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("🔍 OSINT Dasar", callback_data='basic_osint'),
+            InlineKeyboardButton("🛡️ OSINT Advanced", callback_data='advanced_osint')
+        ],
+        [
+            InlineKeyboardButton("📱 Social Media", callback_data='social_media'),
+            InlineKeyboardButton("🌐 Domain/IP", callback_data='domain_ip')
+        ],
+        [
+            InlineKeyboardButton("📧 Email Intel", callback_data='email_intel'),
+            InlineKeyboardButton("☎️ Phone Intel", callback_data='phone_intel')
+        ],
+        [
+            InlineKeyboardButton("❓ Bantuan", callback_data='help'),
+            InlineKeyboardButton("⚙️ Settings", callback_data='settings')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text(
+        "🔰 *OSINT BOT Advanced*\n\n"
+        "Bot ini memiliki kemampuan:\n"
+        "• OSINT Dasar (email, sosmed)\n"
+        "• OSINT Advanced (port scan, vulnerabilities)\n"
+        "• Social Media Intelligence\n"
+        "• Domain & IP Intelligence\n"
+        "• Email Intelligence\n"
+        "• Phone Number Intelligence\n\n"
+        "Pilih menu di bawah atau ketik /help untuk bantuan:",
+        parse_mode='Markdown',
+        reply_markup=reply_markup
+    )
+
+async def menu_command(update, context):
+    """Menampilkan menu utama bot"""
+    keyboard = [
+        [
+            InlineKeyboardButton("🔍 OSINT Dasar", callback_data='basic_osint'),
+            InlineKeyboardButton("🛡️ OSINT Advanced", callback_data='advanced_osint')
+        ],
+        [
+            InlineKeyboardButton("👥 Social Media", callback_data='social_media'),
+            InlineKeyboardButton("🌐 Domain/IP", callback_data='domain_ip')
+        ],
+        [
+            InlineKeyboardButton("📧 Email Intel", callback_data='email_intel'),
+            InlineKeyboardButton("📱 Phone Intel", callback_data='phone_intel')
+        ],
+        [
+            InlineKeyboardButton("❓ Help", callback_data='help'),
+            InlineKeyboardButton("⚙️ Settings", callback_data='settings')
+        ]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = (
+        "*🤖 OSINT BOT MENU*\n\n"
+        "*Basic Commands:*\n"
+        "• /cari [query] - Pencarian umum\n"
+        "• /ig [username] - Cek Instagram\n"
+        "• /email [email] - Validasi email\n"
+        "• /deep [query] - Deep OSINT search\n\n"
+        "*Advanced Commands:*\n"
+        "• /scan [domain/IP] - Advanced scanning\n"
+        "• /breach [email] - Cek data breach\n"
+        "• /domain [domain] - Domain intelligence\n"
+        "• /phone [nomor] - Phone intelligence\n\n"
+        "Pilih menu di bawah untuk informasi lebih lanjut 👇"
+    )
+    
+    update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def button(update, context):
+    """Handle button clicks"""
+    query = update.callback_query
+    query.answer()
+    
+    if query.data == 'basic_osint':
+        text = (
+            "*🔍 FITUR OSINT DASAR*\n\n"
+            "*1. Pencarian Umum*\n"
+            "Command: /cari [nama/username]\n"
+            "• Mencari informasi dari berbagai sumber\n"
+            "• Analisis profil dan aktivitas\n"
+            "• Korelasi data antar platform\n\n"
+            "*2. Instagram Check*\n"
+            "Command: /ig [username]\n"
+            "• Info profil lengkap\n"
+            "• Status akun\n"
+            "• Analisis engagement\n\n"
+            "*3. Email Check*\n"
+            "Command: /email [email]\n"
+            "• Validasi format & domain\n"
+            "• Deteksi disposable email\n"
+            "• Reputasi email\n\n"
+            "*4. Deep Search*\n"
+            "Command: /deep [query]\n"
+            "• Pencarian mendalam\n"
+            "• Multiple source intelligence\n"
+            "• Analisis korelasi data"
+        )
+    
+    elif query.data == 'advanced_osint':
+        text = (
+            "*🛡️ FITUR OSINT ADVANCED*\n\n"
+            "*1. Network Scanner*\n"
+            "Command: /scan [domain/IP]\n"
+            "• Port scanning\n"
+            "• Service detection\n"
+            "• SSL/TLS analysis\n"
+            "• Vulnerability check\n\n"
+            "*2. Data Breach Check*\n"
+            "Command: /breach [email]\n"
+            "• Database leaks\n"
+            "• Compromised accounts\n"
+            "• Exposed credentials\n\n"
+            "*3. Domain Intelligence*\n"
+            "Command: /domain [domain]\n"
+            "• WHOIS info\n"
+            "• DNS records\n"
+            "• Tech stack detection\n\n"
+            "*4. Advanced Features*\n"
+            "• Subdomain enumeration\n"
+            "• Security headers check\n"
+            "• Technology fingerprinting"
+        )
+    
+    elif query.data == 'social_media':
+        text = (
+            "*👥 SOCIAL MEDIA INTELLIGENCE*\n\n"
+            "*1. Instagram Analysis*\n"
+            "Command: /ig [username]\n"
+            "• Profile info\n"
+            "• Post analysis\n"
+            "• Engagement metrics\n\n"
+            "*2. Cross-Platform Search*\n"
+            "Command: /deep [nama]\n"
+            "• Multi-platform detection\n"
+            "• Username correlation\n"
+            "• Activity analysis\n\n"
+            "*3. Platform Support:*\n"
+            "• Instagram\n"
+            "• Twitter\n"
+            "• Facebook\n"
+            "• LinkedIn\n"
+            "• GitHub\n"
+            "• TikTok"
+        )
+    
+    elif query.data == 'domain_ip':
+        text = (
+            "*🌐 DOMAIN & IP INTELLIGENCE*\n\n"
+            "*1. Network Scanning*\n"
+            "Command: /scan [domain/IP]\n"
+            "• Open ports\n"
+            "• Service versions\n"
+            "• Security assessment\n\n"
+            "*2. Domain Analysis*\n"
+            "Command: /domain [domain]\n"
+            "• WHOIS data\n"
+            "• DNS records\n"
+            "• SSL certificates\n"
+            "• Tech stack\n\n"
+            "*3. Advanced Features*\n"
+            "• Subdomain discovery\n"
+            "• Security headers\n"
+            "• Vulnerability scan\n"
+            "• Infrastructure analysis"
+        )
+    
+    elif query.data == 'email_intel':
+        text = (
+            "*📧 EMAIL INTELLIGENCE*\n\n"
+            "*1. Email Validation*\n"
+            "Command: /email [email]\n"
+            "• Format check\n"
+            "• Domain validation\n"
+            "• Disposable detection\n\n"
+            "*2. Breach Check*\n"
+            "Command: /breach [email]\n"
+            "• Data leaks\n"
+            "• Compromised accounts\n"
+            "• Exposed credentials\n\n"
+            "*3. Additional Info*\n"
+            "• Email reputation\n"
+            "• Domain age\n"
+            "• MX records\n"
+            "• Related accounts"
+        )
+    
+    elif query.data == 'phone_intel':
+        text = (
+            "*📱 PHONE INTELLIGENCE*\n\n"
+            "Command: /phone [nomor]\n\n"
+            "*1. Basic Info*\n"
+            "• Number validation\n"
+            "• International format\n"
+            "• National format\n"
+            "• Country code\n\n"
+            "*2. Advanced Info*\n"
+            "• Carrier detection\n"
+            "• Location info\n"
+            "• Timezone data\n"
+            "• Line type\n\n"
+            "*3. Location Tracking*\n"
+            "• City & region\n"
+            "• GPS coordinates\n"
+            "• Google Maps link\n"
+            "• Accuracy estimation\n\n"
+            "*Format Input:*\n"
+            "• +6281234567890\n"
+            "• 081234567890"
+        )
+    
+    elif query.data == 'help':
+        text = (
+            "*❓ PANDUAN PENGGUNAAN*\n\n"
+            "*1. Format Command*\n"
+            "• Gunakan / di awal command\n"
+            "• Tambahkan parameter sesuai format\n"
+            "• Perhatikan spasi antar parameter\n\n"
+            "*2. Tips Penggunaan*\n"
+            "• Mulai dengan fitur dasar\n"
+            "• Gunakan menu untuk navigasi\n"
+            "• Tunggu proses hingga selesai\n"
+            "• Perhatikan format input\n\n"
+            "*3. Batasan*\n"
+            "• Max 5 request/menit\n"
+            "• Hasil dibatasi 10 items\n"
+            "• Scanning butuh waktu\n\n"
+            "*4. Support*\n"
+            "• Contact: @admin"
+        )
+    
+    elif query.data == 'settings':
+        text = (
+            "*⚙️ PENGATURAN*\n\n"
+            "*Coming Soon!*\n\n"
+            "Fitur yang akan tersedia:\n"
+            "• Bahasa interface\n"
+            "• Format output\n"
+            "• Notifikasi\n"
+            "• API key konfigurasi\n"
+            "• Scan preferences\n"
+            "• Privacy settings"
+        )
+    
+    elif query.data == 'menu':
+        keyboard = [
+            [
+                InlineKeyboardButton("🔍 OSINT Dasar", callback_data='basic_osint'),
+                InlineKeyboardButton("🛡️ OSINT Advanced", callback_data='advanced_osint')
+            ],
+            [
+                InlineKeyboardButton("📱 Social Media", callback_data='social_media'),
+                InlineKeyboardButton("🌐 Domain/IP", callback_data='domain_ip')
+            ],
+            [
+                InlineKeyboardButton("📧 Email Intel", callback_data='email_intel'),
+                InlineKeyboardButton("☎️ Phone Intel", callback_data='phone_intel')
+            ],
+            [
+                InlineKeyboardButton("❓ Bantuan", callback_data='help'),
+                InlineKeyboardButton("⚙️ Settings", callback_data='settings')
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = (
+            "🔰 *OSINT BOT Advanced*\n\n"
+            "Bot ini memiliki kemampuan:\n"
+            "• OSINT Dasar (email, sosmed)\n"
+            "• OSINT Advanced (port scan, vulnerabilities)\n"
+            "• Social Media Intelligence\n"
+            "• Domain & IP Intelligence\n"
+            "• Email Intelligence\n"
+            "• Phone Number Intelligence\n\n"
+            "Pilih menu di bawah atau ketik /help untuk bantuan:"
+        )
+        query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode='Markdown')
+        return
+    
+    # Tambahan: Handle refresh dan detail untuk phone
+    elif query.data.startswith('refresh_phone_'):
+        number = query.data.replace('refresh_phone_', '')
+        # Buat context palsu untuk memanggil phone_command
+        class FakeContext:
+            def __init__(self, args):
+                self.args = args
+        
+        fake_update = query.message
+        fake_context = FakeContext([number])
+        
+        # Panggil phone_command dengan update dan context palsu
+        await phone_command(fake_update, fake_context)
+        return
+    
+    elif query.data.startswith('phone_detail_'):
+        number = query.data.replace('phone_detail_', '')
+        
+        try:
+            # Parse nomor telepon
+            if not number.startswith('+'):
+                if number.startswith('0'):
+                    number = '+62' + number[1:]
+                else:
+                    number = '+62' + number
+            
+            parsed = phonenumbers.parse(number)
+            
+            # Dapatkan informasi detail
+            country_code = phonenumbers.region_code_for_number(parsed)
+            country = geocoder.description_for_number(parsed, 'id')
+            carrier_name = carrier.name_for_number(parsed, 'id')
+            timezones = timezone.time_zones_for_number(parsed)
+            
+            # Dapatkan data lokasi
+            location_data = {
+                'ID': {'lat': -6.2088, 'lon': 106.8456, 'city': 'Jakarta', 'region': 'DKI Jakarta'},
+                'MY': {'lat': 3.1390, 'lon': 101.6869, 'city': 'Kuala Lumpur', 'region': 'Wilayah Persekutuan'},
+                'SG': {'lat': 1.3521, 'lon': 103.8198, 'city': 'Singapore', 'region': 'Central Region'},
+                'US': {'lat': 37.7749, 'lon': -122.4194, 'city': 'San Francisco', 'region': 'California'},
+                'GB': {'lat': 51.5074, 'lon': -0.1278, 'city': 'London', 'region': 'England'},
+                'AU': {'lat': -33.8688, 'lon': 151.2093, 'city': 'Sydney', 'region': 'New South Wales'},
+                'JP': {'lat': 35.6762, 'lon': 139.6503, 'city': 'Tokyo', 'region': 'Kanto'},
+                'KR': {'lat': 37.5665, 'lon': 126.9780, 'city': 'Seoul', 'region': 'Seoul Capital Area'},
+                'IN': {'lat': 28.6139, 'lon': 77.2090, 'city': 'New Delhi', 'region': 'Delhi'},
+                'DE': {'lat': 52.5200, 'lon': 13.4050, 'city': 'Berlin', 'region': 'Berlin'}
+            }
+            
+            # Format teks detail
+            text = f"*📱 DETAIL NOMOR TELEPON: {number}*\n\n"
+            
+            # Informasi dasar
+            text += "*1. Informasi Dasar*\n"
+            text += f"├─ Format Internasional: {phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL)}\n"
+            text += f"├─ Format Nasional: {phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.NATIONAL)}\n"
+            text += f"├─ Format E164: {phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)}\n"
+            text += f"├─ Kode Negara: +{parsed.country_code}\n"
+            text += f"└─ Nomor: {parsed.national_number}\n\n"
+            
+            # Informasi lokasi
+            text += "*2. Informasi Lokasi*\n"
+            text += f"├─ Negara: {country}\n"
+            text += f"├─ Kode Negara: {country_code}\n"
+            text += f"├─ Timezone: {', '.join(timezones)}\n"
+            
+            if country_code in location_data:
+                loc = location_data[country_code]
+                text += f"├─ Kota: {loc['city']}\n"
+                text += f"├─ Wilayah: {loc['region']}\n"
+                text += f"├─ Koordinat: {loc['lat']}, {loc['lon']}\n"
+                text += f"└─ Google Maps: https://www.google.com/maps?q={loc['lat']},{loc['lon']}\n\n"
+            else:
+                text += f"└─ Data lokasi tidak tersedia\n\n"
+            
+            # Informasi carrier
+            text += "*3. Informasi Carrier*\n"
+            text += f"├─ Nama: {carrier_name}\n"
+            text += f"├─ Tipe: {'Mobile' if phonenumbers.number_type(parsed) == phonenumbers.PhoneNumberType.MOBILE else 'Fixed Line'}\n"
+            text += f"├─ Prefix: {parsed.country_code_source}\n"
+            text += f"└─ Valid: {'Ya' if phonenumbers.is_valid_number(parsed) else 'Tidak'}\n\n"
+            
+            # Analisis keamanan
+            text += "*4. Analisis Keamanan*\n"
+            text += f"├─ Valid: {'✅ Ya' if phonenumbers.is_valid_number(parsed) else '❌ Tidak'}\n"
+            text += f"├─ Tipe: {'📱 Mobile' if phonenumbers.number_type(parsed) == phonenumbers.PhoneNumberType.MOBILE else '☎️ Fixed Line'}\n"
+            text += f"├─ Portabilitas: {'✅ Ya' if phonenumbers.is_possible_number(parsed) else '❌ Tidak'}\n"
+            text += f"└─ Format: {'✅ Standar' if phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164) == number else '⚠️ Non-standar'}\n\n"
+            
+            # Tambahan: Informasi teknis
+            text += "*5. Informasi Teknis*\n"
+            text += f"├─ Country Code Source: {parsed.country_code_source}\n"
+            text += f"├─ Preferred Domestic Carrier Code: {parsed.preferred_domestic_carrier_code}\n"
+            text += f"├─ Number of Leading Zeros: {parsed.number_of_leading_zeros}\n"
+            text += f"└─ Raw Input: {parsed.raw_input}\n\n"
+            
+            # Tambahan: Tips keamanan
+            text += "*6. Tips Keamanan*\n"
+            text += "├─ Jangan bagikan nomor telepon Anda di platform publik\n"
+            text += "├─ Gunakan nomor virtual untuk layanan online\n"
+            text += "├─ Aktifkan autentikasi dua faktor jika tersedia\n"
+            text += "└─ Periksa secara berkala apakah nomor Anda muncul dalam kebocoran data\n"
+            
+            # Edit pesan dengan detail
+            query.edit_message_text(text=text, parse_mode='Markdown')
+            
+            # Tambahkan tombol kembali
+            keyboard = [
+                [
+                    InlineKeyboardButton("🔄 Refresh", callback_data=f'refresh_phone_{number}'),
+                    InlineKeyboardButton("🏠 Menu", callback_data='menu')
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            query.message.reply_text(
+                "✨ Detail nomor telepon telah ditampilkan. Pilih aksi selanjutnya:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in phone detail: {str(e)}")
+            query.edit_message_text(f"❌ Error: {str(e)}")
+            return
+    
+    else:
+        text = "Menu tidak valid"
+    
+    try:
+        query.edit_message_text(text=text, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error in button handler: {str(e)}")
+        query.edit_message_text(text="Terjadi error saat memproses menu")
+
+def help_command(update, context):
+    keyboard = [
+        [
+            InlineKeyboardButton("🔍 Mulai Pencarian", callback_data='cari_lengkap'),
+            InlineKeyboardButton("🏠 Menu Utama", callback_data='menu')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text(
+        "Cara pake bot:\n"
+        "1. Ketik nama yang mau dicari\n"
+        "2. Pilih jenis pencarian dari menu\n"
+        "3. Tunggu hasil pencarian\n\n"
+        "Tips: Makin lengkap nama makin akurat hasilnya!",
+        reply_markup=reply_markup
+    )
+
+def cari_info(update, context):
+    nama = update.message.text.strip()
+    context.user_data['last_search'] = nama  # Simpan nama untuk digunakan nanti
+    
+    update.message.reply_text(f"🔍 Mencari info tentang {nama}...")
+    
+    # Jalankan deep search
+    asyncio.run(deep_osint_search(nama, update))
+
+def menu_command(update, context):
+    keyboard = [
+        [
+            InlineKeyboardButton("🔍 Cari Info Lengkap", callback_data='cari_lengkap'),
+            InlineKeyboardButton("📱 Cari Instagram", callback_data='cari_ig')
+        ],
+        [
+            InlineKeyboardButton("📧 Cari Email", callback_data='cari_email'),
+            InlineKeyboardButton("❓ Bantuan", callback_data='help')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text(
+        "Menu Utama OSINT Bot:\nPilih jenis pencarian atau ketik langsung nama yang mau dicari",
+        reply_markup=reply_markup
+    )
+
+async def cari_command(update, context):
+    """Handler untuk command /cari [query]"""
+    if not context.args:
+        update.message.reply_text(
+            "❌ Format: /cari [query]\n"
+            "Contoh:\n"
+            "• /cari John Doe\n"
+            "• /cari johndoe123"
+        )
+        return
+    
+    query = ' '.join(context.args)
+    status_message = update.message.reply_text("🔍 Memulai pencarian...")
+    
+    try:
+        # Track penggunaan command
+        track_user(update.effective_user.id, update.effective_user.username)
+        
+        # Mulai animasi loading
+        loading_task = asyncio.create_task(
+            update_loading_animation(status_message, f"🔍 Mencari informasi tentang {query}")
+        )
+        
+        try:
+            # Lakukan pencarian
+            results = await deep_osint_search(query, update)
+            formatted_text = format_search_results(results)
+            
+            # Batalkan animasi loading
+            loading_task.cancel()
+            
+            # Edit pesan dengan hasil
+            status_message.edit_text(formatted_text, parse_mode='Markdown')
+            
+            # Tambahkan tombol aksi
+            keyboard = [
+                [
+                    InlineKeyboardButton("🔄 Refresh", callback_data=f'refresh_search_{query}'),
+                    InlineKeyboardButton("📊 Detail", callback_data=f'search_detail_{query}')
+                ],
+                [
+                    InlineKeyboardButton("🏠 Menu", callback_data='menu')
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            update.message.reply_text(
+                "✨ Pencarian selesai! Pilih aksi selanjutnya:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            # Batalkan animasi loading jika terjadi error
+            loading_task.cancel()
+            logger.error(f"Search error: {str(e)}")
+            status_message.edit_text(f"❌ Error: {str(e)}")
+            
+    except Exception as e:
+        logger.error(f"Cari command error: {str(e)}")
+        if 'status_message' in locals():
+            status_message.edit_text("❌ Terjadi error yang tidak diketahui")
+        else:
+            update.message.reply_text("❌ Terjadi error yang tidak diketahui")
+
+async def check_social_media(username):
+    """Fungsi untuk mencari dan menganalisis profil social media dengan multiple methods"""
+    results = {}
+    
+    # Import dependencies
+    import aiohttp
+    import asyncio
+    from bs4 import BeautifulSoup
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    import json
+    import re
+    from urllib.parse import quote_plus
+    
+    # Import specific config variables
+    from config import (
+        TWITTER_BEARER_TOKEN,
+        GITHUB_API_TOKEN,
+        INSTAGRAM_API_KEY,
+        YOUTUBE_API_KEY,
+        REDDIT_CLIENT_ID,
+        REDDIT_CLIENT_SECRET,
+        GITLAB_API_TOKEN,
+        MEDIUM_API_TOKEN,
+        DEVTO_API_KEY,
+        API_ENDPOINTS,
+        SEARCH_PLATFORMS,
+        RATE_LIMIT_DELAY,
+        SCRAPE_HEADERS
+    )
+    
+    # Setup headers untuk berbagai API
+    api_headers = {
+        'twitter': {'Authorization': f'Bearer {TWITTER_BEARER_TOKEN}'} if TWITTER_BEARER_TOKEN else None,
+        'github': {'Authorization': f'token {GITHUB_API_TOKEN}'} if GITHUB_API_TOKEN else None,
+        'instagram': {'Authorization': f'Bearer {INSTAGRAM_API_KEY}'} if INSTAGRAM_API_KEY else None,
+        'youtube': {'key': YOUTUBE_API_KEY} if YOUTUBE_API_KEY else None,
+        'reddit': {
+            'User-Agent': 'OSINT-Bot/1.0',
+            'Authorization': f'Basic {REDDIT_CLIENT_ID}:{REDDIT_CLIENT_SECRET}'
+        },
+        'gitlab': {'PRIVATE-TOKEN': GITLAB_API_TOKEN} if GITLAB_API_TOKEN else None,
+        'medium': {'Authorization': f'Bearer {MEDIUM_API_TOKEN}'} if MEDIUM_API_TOKEN else None,
+        'devto': {'api-key': DEVTO_API_KEY} if DEVTO_API_KEY else None
+    }
+
+    # Setup Chrome options untuk web scraping
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    
+    async def check_platform_api(platform, username):
+        """Metode 1: Menggunakan API Platform"""
+        if platform not in API_ENDPOINTS:
+            return None
+        
+        url = API_ENDPOINTS[platform].format(username=username)
+        headers = api_headers.get(platform, {})
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        return await response.json()
+            return None
+        except Exception as e:
+            logger.error(f"API Error {platform}: {str(e)}")
+            return None
+    
+    async def check_platform_scrape(platform, username):
+        """Metode 2: Web Scraping dengan Selenium"""
+        platform_urls = {
+            'twitter': f'https://twitter.com/{username}',
+            'instagram': f'https://www.instagram.com/{username}/',
+            'github': f'https://github.com/{username}',
+            'reddit': f'https://www.reddit.com/user/{username}',
+            'linkedin': f'https://www.linkedin.com/in/{username}',
+            'facebook': f'https://www.facebook.com/{username}',
+            'tiktok': f'https://www.tiktok.com/@{username}',
+            'youtube': f'https://www.youtube.com/@{username}'
+        }
+        
+        if platform not in platform_urls:
+            return None
+        
+        driver = None
+        try:
+            driver = webdriver.Chrome(options=chrome_options)
+            driver.get(platform_urls[platform])
+            wait = WebDriverWait(driver, 5)
+            
+            # Platform-specific scraping logic
+            if platform == 'twitter':
+                try:
+                    bio = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="UserDescription"]')))
+                    followers = driver.find_elements(By.CSS_SELECTOR, '[data-testid="UserProfileStats"]')
+                    return {
+                        'found': True,
+                        'bio': bio.text if bio else None,
+                        'stats': [f.text for f in followers] if followers else None
+                    }
+                except Exception:
+                    pass
+                    
+            elif platform == 'instagram':
+                try:
+                    bio = wait.until(EC.presence_of_element_located((By.CLASS_NAME, '_aa_c')))
+                    stats = driver.find_elements(By.CLASS_NAME, '_ac2a')
+                    return {
+                        'found': True,
+                        'bio': bio.text if bio else None,
+                        'stats': [s.text for s in stats] if stats else None
+                    }
+                except Exception:
+                    pass
+                    
+            # Add more platform-specific scraping logic...
+            
+        except Exception as e:
+            logger.error(f"Scraping Error {platform}: {str(e)}")
+            return None
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+        return None
+    
+    async def check_platform_osint(platform, username):
+        """Metode 3: OSINT Tools dan Teknik"""
+        results = []
+        try:
+            # 1. Google Dorks
+            dorks = {
+                'twitter': f'site:twitter.com intext:"{username}"',
+                'github': f'site:github.com intext:"{username}"',
+                'linkedin': f'site:linkedin.com intext:"{username}"',
+                'facebook': f'site:facebook.com intext:"{username}"'
+            }
+            
+            for dork in dorks:
+                try:
+                    search_results = search(dork, num_results=5)
+                    results.extend(search_results)
+                except Exception as e:
+                    logger.error(f"Google dork error for {platform}: {str(e)}")
+                    continue
+                
+            return results
+        except Exception as e:
+            logger.error(f"OSINT Error {platform}: {str(e)}")
+            return None
+    
+    # Proses pencarian untuk setiap platform
+    for platform in SEARCH_PLATFORMS:
+        try:
+            # Coba metode 1: API
+            result = await check_platform_api(platform, username)
+            if result:
+                results[platform] = {'method': 'api', 'data': result}
+                continue
+                
+            # Jika API gagal, coba metode 2: Scraping
+            result = await check_platform_scrape(platform, username)
+            if result:
+                results[platform] = {'method': 'scrape', 'data': result}
+                continue
+                
+            # Jika scraping gagal, coba metode 3: OSINT
+            result = await check_platform_osint(platform, username)
+            if result:
+                results[platform] = {'method': 'osint', 'data': result}
+                
+        except Exception as e:
+            logger.error(f"Error checking {platform}: {str(e)}")
+            continue
+            
+        # Rate limiting antara requests
+        await asyncio.sleep(RATE_LIMIT_DELAY)
+    
+    return results
+
+def format_social_media_results(results):
+    """Format hasil pencarian social media dengan detail lengkap"""
+    formatted_text = "📱 *HASIL PENCARIAN SOCIAL MEDIA*\n" + "="*30 + "\n\n"
+    
+    if not results:
+        return formatted_text + "❌ Tidak ditemukan profil social media\n"
+    
+    for platform, data in results.items():
+        method = data.get('method', 'unknown')
+        platform_data = data.get('data', {})
+        
+        if platform_data:
+            formatted_text += f"{get_platform_emoji(platform)} *{platform.upper()}*\n"
+            formatted_text += f"├─ 🔍 Metode: {method.upper()}\n"
+            
+            if method == 'api':
+                # Format API results
+                if platform_data.get('username'):
+                    formatted_text += f"├─ 👤 Username: @{platform_data['username']}\n"
+                if platform_data.get('name') or platform_data.get('full_name'):
+                    formatted_text += f"├─ 📛 Nama: {platform_data.get('name') or platform_data.get('full_name')}\n"
+                if platform_data.get('bio') or platform_data.get('description'):
+                    bio = platform_data.get('bio') or platform_data.get('description')
+                    formatted_text += f"├─ 📝 Bio: {bio[:100]}...\n"
+                if platform_data.get('followers_count'):
+                    formatted_text += f"├─ 👥 Followers: {platform_data['followers_count']}\n"
+                if platform_data.get('location'):
+                    formatted_text += f"├─ 📍 Location: {platform_data['location']}\n"
+                    
+            elif method == 'scrape':
+                # Format scraped results
+                if platform_data.get('bio'):
+                    formatted_text += f"├─ 📝 Bio: {platform_data['bio'][:100]}...\n"
+                if platform_data.get('stats'):
+                    formatted_text += f"├─ 📊 Stats: {', '.join(platform_data['stats'])}\n"
+                    
+            elif method == 'osint':
+                # Format OSINT results
+                if platform_data.get('dork_results'):
+                    formatted_text += f"├─ 🔍 Google Results:\n"
+                    for result in platform_data['dork_results']:
+                        formatted_text += f"│  • {result[:100]}...\n"
+                if platform_data.get('archived'):
+                    formatted_text += f"├─ 📚 Archive: {platform_data['archive_url']}\n"
+                if platform_data.get('data'):
+                    formatted_text += f"├─ ℹ️ Additional Info: Found via {platform_data.get('source', 'OSINT')}\n"
+            
+            formatted_text += "\n"
+    
+    return formatted_text
+
+async def check_free_sources(query):
+    results = {
+        "social_media": {},
+        "email_info": {},
+        "domain_info": {},
+        "phone_info": {},
+        "leaks": []
+    }
+    
+    # Gunakan fungsi check_social_media untuk pencarian social media
+    social_results = await check_social_media(query)
+    if social_results:
+        results["social_media"] = social_results
+    
+    # Lanjutkan dengan pengecekan lainnya...
+    # ... existing code ...
+    
+    return results
+
+def error_handler(update, context):
+    """Log Errors caused by Updates."""
+    logger.warning('Update "%s" caused error "%s"', update, context.error)
+    
+    try:
+        if update.message:
+            error_msg = config.ERROR_MESSAGES.get('unknown', '❌ Terjadi error yang tidak diketahui')
+            if isinstance(context.error, Unauthorized):
+                error_msg = "❌ Bot tidak memiliki akses"
+            elif isinstance(context.error, BadRequest):
+                error_msg = "❌ Request tidak valid"
+            elif isinstance(context.error, TimedOut):
+                error_msg = "❌ Request timeout, coba lagi"
+            elif isinstance(context.error, NetworkError):
+                error_msg = "❌ Masalah koneksi, coba lagi nanti"
+            
+            update.message.reply_text(error_msg)
+    except:
+        pass
+
+async def check_email_info(email):
+    """Fungsi untuk mengecek informasi detail tentang email"""
+    results = {
+        "validation": {},
+        "domain_info": {},
+        "breaches": [],
+        "social_profiles": {},
+        "disposable": False,
+        "reputation": {},
+        "mx_records": [],
+        "additional_emails": []
+    }
+    
+    try:
+        # 1. Basic Email Validation
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        results['validation']['format_valid'] = bool(re.match(email_pattern, email))
+        
+        # Get domain from email
+        domain = email.split('@')[1]
+        
+        # 2. Domain Validation & MX Records
+        try:
+            mx_records = dns.resolver.resolve(domain, 'MX')
+            results['mx_records'] = [str(mx.exchange) for mx in mx_records]
+            results['validation']['domain_valid'] = True
+        except:
+            results['validation']['domain_valid'] = False
+        
+        # 3. Check if Disposable Email
+        disposable_domains = ['tempmail', 'temp-mail', 'guerrillamail', '10minutemail', 'throwawaymail']
+        results['disposable'] = any(d in domain.lower() for d in disposable_domains)
+        
+        # 4. Domain Age & Info
+        try:
+            domain_info = whois.whois(domain)
+            results['domain_info'] = {
+                'registrar': domain_info.registrar,
+                'creation_date': str(domain_info.creation_date),
+                'expiration_date': str(domain_info.expiration_date),
+                'last_updated': str(domain_info.updated_date),
+                'status': domain_info.status
+            }
+        except:
+            pass
+        
+        # 5. Email Reputation Check (EmailRep.io)
+        if hasattr(config, 'EMAILREP_API_KEY') and config.EMAILREP_API_KEY:
+            try:
+                headers = {'Key': config.EMAILREP_API_KEY}
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f'https://emailrep.io/{email}', headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            results['reputation'] = {
+                                'reputation_score': data.get('reputation', 'unknown'),
+                                'suspicious': data.get('suspicious', False),
+                                'references': data.get('references', 0),
+                                'details': {
+                                    'blacklisted': data.get('details', {}).get('blacklisted', False),
+                                    'malicious_activity': data.get('details', {}).get('malicious_activity', False),
+                                    'credential_leaked': data.get('details', {}).get('credentials_leaked', False),
+                                    'first_seen': data.get('details', {}).get('first_seen', 'unknown'),
+                                    'last_seen': data.get('details', {}).get('last_seen', 'unknown')
+                                }
+                            }
+            except:
+                pass
+        
+        # 6. Data Breach Check
+        breaches = await check_data_breaches(email)
+        if breaches:
+            results['breaches'] = breaches
+        
+        # 7. Find Related Social Profiles
+        username = email.split('@')[0]
+        social_results = await check_social_media(username)
+        if social_results:
+            results['social_profiles'] = social_results
+        
+        # 8. Generate Additional Email Variations
+        name_parts = username.split('.')
+        if len(name_parts) >= 2:
+            first_name = name_parts[0]
+            last_name = name_parts[-1]
+            variations = [
+                f"{first_name}.{last_name}@{domain}",
+                f"{first_name}{last_name}@{domain}",
+                f"{first_name[0]}{last_name}@{domain}",
+                f"{first_name}_{last_name}@{domain}",
+                f"{last_name}.{first_name}@{domain}"
+            ]
+            results['additional_emails'] = list(set(variations) - {email})
+        
+    except Exception as e:
+        logger.error(f"Error in email info check: {str(e)}")
+    
+    return results
+
+def format_email_results(results):
+    """Format hasil analisis email"""
+    if not results:
+        return "*📧 Hasil Analisis Email*\n\n❌ Tidak ada data yang ditemukan"
+        
+    text = "*📧 Hasil Analisis Email*\n\n"
+    
+    # Format validation
+    if 'validation' in results:
+        text += "*🔍 Validasi Email:*\n"
+        validation = results['validation']
+        if validation.get('format_valid'):
+            text += "├─ ✅ Format Email Valid\n"
+        else:
+            text += "├─ ❌ Format Email Tidak Valid\n"
+        if validation.get('domain_valid'):
+            text += "├─ ✅ Domain Email Valid\n"
+        else:
+            text += "├─ ❌ Domain Email Tidak Valid\n"
+    
+    return text
+
+async def email_command(update, context):
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Mohon berikan alamat email yang ingin dianalisis.\n"
+            "Contoh: /email example@domain.com"
+        )
+        return
+
+    email = context.args[0]
+    status_message = await update.message.reply_text("🔍 Memulai analisis email...")
+    loading_task = await start_loading(status_message, "📧 Menganalisis email " + email)
+    
+    try:
+        results = await check_email_info(email)
+        formatted_results = format_email_results(results)
+        loading_task.cancel()
+        
+        # Buat keyboard inline untuk refresh
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_email_{email}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await status_message.edit_text(
+            formatted_results,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        loading_task.cancel()
+        logger.error(f"Email analysis error: {str(e)}")
+        await status_message.edit_text(f"❌ Error: {str(e)}")
+
+# Fungsi untuk mencari informasi domain
+def check_domain_info(domain):
+    info = {}
+    try:
+        # DNS Records
+        for qtype in ['A', 'MX', 'NS', 'TXT']:
+            try:
+                answers = dns.resolver.resolve(domain, qtype)
+                info[qtype] = [str(rdata) for rdata in answers]
+            except:
+                info[qtype] = []
+        
+        # Whois Info
+        w = whois.whois(domain)
+        info['whois'] = {
+            'registrar': w.registrar,
+            'creation_date': str(w.creation_date),
+            'expiration_date': str(w.expiration_date),
+            'emails': w.emails
+        }
+    except Exception as e:
+        info['error'] = str(e)
+    return info
+
+# Fungsi untuk mencari informasi teknologi yang digunakan website
+async def check_tech_stack(url):
+    tech_stack = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://api.wappalyzer.com/v2/lookup/?url={url}", 
+                headers={"x-api-key": config.WAPPALYZER_API_KEY}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    tech_stack = [tech['name'] for tech in data.get('technologies', [])]
+    except:
+        pass
+    return tech_stack
+
+# Fungsi untuk mencari email yang terkait dengan domain
+async def find_leaked_emails(domain):
+    emails = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.dehashed.com/search?query=domain:{domain}",
+                headers={"Authorization": f"Bearer {config.DEHASHED_API_KEY}"}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    emails = [entry['email'] for entry in data.get('entries', [])]
+    except:
+        pass
+    return emails
+
+# Fungsi analisis teks menggunakan tools gratis
+def analyze_text_free(text):
+    """Fungsi untuk analisis teks dengan error handling yang lebih baik"""
+    analysis = {
+        "sentiment": None,
+        "keywords": [],
+        "entities": [],
+        "summary": ""
+    }
+    
+    if not text:
+        return analysis
+        
+    try:
+        # Analisis sentimen dengan TextBlob
+        blob = TextBlob(text)
+        analysis["sentiment"] = {
+            "polarity": blob.sentiment.polarity,
+            "subjectivity": blob.sentiment.subjectivity
+        }
+        
+        try:
+            # Keywords extraction
+            words = word_tokenize(text)
+            stop_words = set(stopwords.words('english'))
+            keywords = [word.lower() for word in words 
+                       if word.isalnum() and word.lower() not in stop_words]
+            analysis["keywords"] = list(set(keywords))[:10]
+        except Exception as e:
+            print(f"Warning: Keyword extraction error: {str(e)}")
+        
+        try:
+            # Entity recognition dengan fallback ke simple NNP detection
+            try:
+                tagged = nltk.pos_tag(words)
+                analysis["entities"] = [word for word, tag in tagged 
+                                      if tag.startswith(('NNP', 'NNPS'))]
+            except:
+                # Fallback: deteksi kata yang diawali huruf kapital
+                analysis["entities"] = [word for word in words 
+                                      if word and word[0].isupper()]
+        except Exception as e:
+            print(f"Warning: Entity recognition error: {str(e)}")
+        
+        try:
+            # Simple summarization
+            sentences = blob.sentences
+            if sentences:
+                analysis["summary"] = str(sentences[0])
+        except Exception as e:
+            print(f"Warning: Summarization error: {str(e)}")
+            
+    except Exception as e:
+        print(f"Error in text analysis: {str(e)}")
+    
+    return analysis
+
+# Fungsi untuk memformat hasil pencarian
+def format_search_results(results, query_type="general"):
+    """Format hasil pencarian untuk ditampilkan"""
+    text = "*🔍 HASIL PENCARIAN OSINT*\n\n"
+    
+    # Social Media
+    if results.get('social_media'):
+        text += "*👤 Profil Social Media:*\n"
+        for platform, info in results['social_media'].items():
+            if info.get('found'):
+                emoji = get_platform_emoji(platform)
+                text += f"{emoji} *{platform.title()}*\n"
+                if info.get('username'):
+                    text += f"├─ Username: {info['username']}\n"
+                if info.get('url'):
+                    text += f"├─ URL: {info['url']}\n"
+                if info.get('followers'):
+                    text += f"├─ Followers: {info['followers']}\n"
+                if info.get('bio'):
+                    text += f"└─ Bio: {info['bio'][:100]}...\n"
+                text += "\n"
+    
+    # Email
+    if results.get('email_found'):
+        text += "*📧 Email Terkait:*\n"
+        for email in results['email_found'][:5]:
+            text += f"├─ {email}\n"
+        if len(results['email_found']) > 5:
+            text += f"└─ ...dan {len(results['email_found'])-5} email lainnya\n\n"
+    else:
+            text = text[:-1] + "└" + text[-1] + "\n\n"
+    
+    # Phone Numbers
+    if results.get('phone_numbers'):
+        text += "*📱 Nomor Telepon:*\n"
+        for phone in results['phone_numbers'][:3]:
+            text += f"├─ {phone}\n"
+        if len(results['phone_numbers']) > 3:
+            text += f"└─ ...dan {len(results['phone_numbers'])-3} nomor lainnya\n\n"
+        else:
+            text = text[:-1] + "└" + text[-1] + "\n\n"
+    
+    # Websites
+    if results.get('websites'):
+        text += "*🌐 Website Terkait:*\n"
+        for site in results['websites'][:5]:
+            text += f"├─ {site}\n"
+        if len(results['websites']) > 5:
+            text += f"└─ ...dan {len(results['websites'])-5} website lainnya\n\n"
+        else:
+            text = text[:-1] + "└" + text[-1] + "\n\n"
+    
+    # Additional Info
+    if results.get('additional_info'):
+        text += "*ℹ️ Informasi Tambahan:*\n"
+        for key, value in results['additional_info'].items():
+            if isinstance(value, dict):
+                text += f"*{key.replace('_', ' ').title()}:*\n"
+                for k, v in value.items():
+                    text += f"├─ {k}: {v}\n"
+            else:
+                text += f"└─ {key.replace('_', ' ').title()}: {value}\n"
+    
+    if text == "*🔍 HASIL PENCARIAN OSINT*\n\n":
+        text += "❌ Tidak ditemukan informasi yang relevan."
+    
+    return text
+
+def get_platform_emoji(platform):
+    """Mendapatkan emoji yang sesuai untuk platform"""
+    emoji_map = {
+        'Twitter': '🐦',
+        'GitHub': '💻',
+        'LinkedIn': '💼',
+        'Instagram': '📸',
+        'Facebook': '👥',
+        'TikTok': '🎵',
+        'Reddit': '🤖',
+        'Pinterest': '📌',
+        'Spotify': '🎵',
+        'Discord': '💬',
+        'Telegram': '📱'
+    }
+    return emoji_map.get(platform, '🌐')
+
+# Fungsi untuk mencari data breach
+async def check_data_breaches(email):
+    """Fungsi untuk mencari data breach menggunakan sumber gratis"""
+    results = []
+    try:
+        # 1. Check email domain
+        domain = email.split('@')[1]
+        try:
+            mx_records = dns.resolver.resolve(domain, 'MX')
+            if not mx_records:
+                results.append({
+                    'Name': 'Domain Validation',
+                    'BreachDate': datetime.now().strftime('%Y-%m-%d'),
+                    'DataClasses': ['Invalid Email Domain']
+                })
+        except:
+            results.append({
+                'Name': 'Domain Validation',
+                'BreachDate': datetime.now().strftime('%Y-%m-%d'),
+                'DataClasses': ['Invalid Email Domain']
+            })
+
+        # 2. Google Dork Check
+        dorks = [
+            f'site:pastebin.com {email}',
+            f'site:github.com {email}'
+        ]
+        
+        for dork in dorks:
+            try:
+                url = f"https://www.google.com/search?q={quote_plus(dork)}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=config.SCRAPE_HEADERS) as response:
+                        if response.status == 200 and email.lower() in response.text.lower():
+                            results.append({
+                                'Name': 'Public Exposure',
+                                'BreachDate': datetime.now().strftime('%Y-%m-%d'),
+                                'DataClasses': ['Found in Public Sources']
+                            })
+                            break
+            except:
+                continue
+
+        # 3. Check disposable email
+        disposable_domains = ['tempmail', 'temp-mail', 'guerrillamail', '10minutemail']
+        if any(d in domain.lower() for d in disposable_domains):
+            results.append({
+                'Name': 'Email Security',
+                'BreachDate': datetime.now().strftime('%Y-%m-%d'),
+                'DataClasses': ['Disposable Email Detected']
+            })
+
+    except Exception as e:
+        logger.error(f"Error checking breaches: {str(e)}")
+    
+    return results
+
+# Fungsi untuk mencari akun yang terkait
+async def find_linked_accounts(email):
+    results = {}
+    platforms = [
+        'twitter.com',
+        'github.com',
+        'linkedin.com',
+        'facebook.com',
+        'instagram.com'
+    ]
+    
+    try:
+        username = email.split('@')[0]
+        
+        for platform in platforms:
+            try:
+                url = f"https://{platform}/{username}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=config.SCRAPE_HEADERS, timeout=5) as response:
+                        if response.status == 200:
+                            results[platform] = {
+                                'found': True,
+                                'url': url,
+                                'username': username
+                            }
+            except:
+                continue
+                
+        # Cek reputasi email
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {'Key': config.EMAILREP_API_KEY} if hasattr(config, 'EMAILREP_API_KEY') else {}
+                async with session.get(f"https://emailrep.io/{email}", headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        results['reputation'] = data
+        except:
+            pass
+            
+    except Exception as e:
+        logger.error(f"Error finding linked accounts: {str(e)}")
+    
+    return results
+
+# Update fungsi format hasil pencarian
+def format_free_search_results(results):
+    """Format hasil pencarian dari sumber gratis"""
+    formatted_text = f"📊 HASIL PENCARIAN OSINT\n{'='*30}\n\n"
+    
+    # Social Media
+    if results.get('social_media'):
+        formatted_text += "📱 SOCIAL MEDIA\n"
+        formatted_text += "└──────────────\n"
+        for platform, data in results['social_media'].items():
+            if data.get('found'):
+                formatted_text += f"├─ {get_platform_emoji(platform)} {platform}\n"
+                formatted_text += f"├─ 🔗 {data['url']}\n"
+                formatted_text += "└──────────────\n"
+        formatted_text += "\n"
+    
+    # Domain Info
+    if results.get('domain_info'):
+        formatted_text += "🌐 INFORMASI DOMAIN\n"
+        formatted_text += "└──────────────\n"
+        if 'whois' in results['domain_info']:
+            whois_data = results['domain_info']['whois']
+            formatted_text += f"├─ 📅 Dibuat: {whois_data.get('creation_date', 'Tidak diketahui')}\n"
+            formatted_text += f"├─ 🏢 Registrar: {whois_data.get('registrar', 'Tidak diketahui')}\n"
+        for record_type, records in results['domain_info'].items():
+            if record_type not in ['whois', 'error'] and records:
+                formatted_text += f"├─ 📝 {record_type}: {', '.join(records[:3])}...\n"
+        formatted_text += "└──────────────\n\n"
+    
+    # Phone Info
+    if results.get('phone_info'):
+        formatted_text += "📱 INFO NOMOR\n"
+        formatted_text += "└──────────────\n"
+        phone_info = results['phone_info']
+        if 'error' not in phone_info:
+            formatted_text += f"├─ ✅ Valid: {'Ya' if phone_info.get('valid') else 'Tidak'}\n"
+            formatted_text += f"├─ 📍 Lokasi: {phone_info.get('location', 'Tidak diketahui')}\n"
+            formatted_text += f"├─ 🎯 Provider: {phone_info.get('carrier', 'Tidak diketahui')}\n"
+            formatted_text += f"├─ 🌐 Timezone: {', '.join(phone_info.get('timezone', ['Tidak diketahui']))}\n"
+            formatted_text += f"├─ 📱 Tipe: {phone_info.get('type', 'Tidak diketahui')}\n"
+        formatted_text += "└──────────────\n\n"
+    
+    # Email Info
+    if results.get('email_info'):
+        formatted_text += "📧 INFO EMAIL\n"
+        formatted_text += "└──────────────\n"
+        email_info = results['email_info']
+        formatted_text += f"├─ ✉️ Domain Valid: {'Ya' if email_info.get('valid_domain') else 'Tidak'}\n"
+        if email_info.get('mx_records'):
+            formatted_text += f"├─ 📨 MX Records: {', '.join(email_info['mx_records'][:3])}...\n"
+        formatted_text += "└──────────────\n\n"
+    
+    # Leaks Info
+    if results.get('leaks'):
+        formatted_text += "🚨 KEBOCORAN DATA\n"
+        formatted_text += "└──────────────\n"
+        for leak in results['leaks']:
+            formatted_text += f"├─ 🔍 Sumber: {leak['source']}\n"
+            formatted_text += f"├─ ⚠️ Ditemukan: {'Ya' if leak.get('found') else 'Tidak'}\n"
+        formatted_text += "└──────────────\n"
+    
+    return formatted_text
+
+async def deep_osint_search(query):
+    """Melakukan pencarian OSINT mendalam"""
+    try:
+        results = {
+            'social_media': [],
+            'websites': [],
+            'documents': [],
+            'images': []
+        }
+        
+        # Implementasi pencarian mendalam
+        social_results = await check_social_media(query)
+        if social_results:
+            results['social_media'] = social_results
+            
+        return results
+    except Exception as e:
+        logger.error(f"Deep search error: {str(e)}")
+        raise Exception(f"Gagal melakukan pencarian mendalam: {str(e)}")
+
+def format_ip_results(results):
+    """Format hasil analisis IP untuk ditampilkan"""
+    text = "*🌐 IP INTELLIGENCE*\n\n"
+    
+    # Informasi Dasar
+    if 'basic_info' in results:
+        text += "*ℹ️ Informasi Dasar:*\n"
+        if 'os' in results['basic_info']:
+            text += f"├─ OS: {results['basic_info']['os']}\n"
+        if 'organization' in results['basic_info']:
+            text += f"├─ Organisasi: {results['basic_info']['organization']}\n"
+        if 'hostnames' in results['basic_info']:
+            hostnames = results['basic_info']['hostnames']
+            if hostnames:
+                text += f"├─ Hostname: {', '.join(hostnames[:3])}\n"
+        if 'last_update' in results['basic_info']:
+            text += f"└─ Update Terakhir: {results['basic_info']['last_update']}\n\n"
+    
+    # Informasi Lokasi
+    if 'location' in results:
+        text += "*📍 Lokasi:*\n"
+        loc = results['location']
+        text += f"├─ Negara: {loc.get('country', 'Unknown')}\n"
+        text += f"├─ Kota: {loc.get('city', 'Unknown')}\n"
+        text += f"├─ Wilayah: {loc.get('region', 'Unknown')}\n"
+        if 'lat' in loc and 'lon' in loc and loc['lat'] and loc['lon']:
+            text += f"└─ Maps: https://www.google.com/maps?q={loc['lat']},{loc['lon']}\n\n"
+        else:
+            text += "└─ Koordinat: Tidak tersedia\n\n"
+    
+    # Informasi Reputasi
+    if 'reputation' in results:
+        text += "*🛡️ Reputasi:*\n"
+        rep = results['reputation']
+        text += f"├─ Skor Abuse: {rep.get('abuse_score', 'Unknown')}/100\n"
+        text += f"├─ Total Laporan: {rep.get('total_reports', 0)}\n"
+        text += f"├─ Laporan Terakhir: {rep.get('last_reported', 'Never')}\n"
+        text += f"├─ Tipe Penggunaan: {rep.get('usage_type', 'Unknown')}\n"
+        text += f"└─ ISP: {rep.get('isp', 'Unknown')}\n\n"
+    
+    # Port Terbuka
+    if 'ports' in results and results['ports']:
+        text += "*🔌 Port Terbuka:*\n"
+        for port in results['ports'][:10]:
+            text += f"├─ {port}\n"
+        if len(results['ports']) > 10:
+            text += f"└─ ...dan {len(results['ports'])-10} port lainnya\n\n"
+        else:
+            text = text[:-1] + "└" + text[-1] + "\n"
+    
+    # Vulnerability
+    if 'vulnerabilities' in results and results['vulnerabilities']:
+        text += "*🔓 Vulnerability:*\n"
+        for vuln in results['vulnerabilities'][:5]:
+            text += f"├─ {vuln['cve']} (CVSS: {vuln['cvss']})\n"
+            text += f"│  {vuln['summary'][:100]}...\n"
+        if len(results['vulnerabilities']) > 5:
+            text += f"└─ ...dan {len(results['vulnerabilities'])-5} vulnerability lainnya\n"
+        else:
+            text = text[:-1] + "└" + text[-1]
+    
+    return text
+
+async def update_bot_name(context):
+    """Update nama bot dengan jumlah pengguna bulanan"""
+    try:
+        monthly_count = len(total_monthly_users)
+        formatted_count = "{:,}".format(monthly_count)
+        await context.bot.set_my_name(name=f"OSINT Bot")
+        await context.bot.set_my_description(f"🤖 Bot OSINT dengan {formatted_count} pengguna bulan ini\n\nGunakan /help untuk bantuan")
+        logger.info(f"Updated bot stats: {formatted_count} monthly users")
+    except Exception as e:
+        logger.error(f"Error updating bot name: {str(e)}")
+
+# Tambahkan variabel global untuk statistik
+command_stats = {}
+monthly_command_count = 0
+
+async def analyze_domain(domain):
+    """Menganalisis domain menggunakan berbagai tools dan API"""
+    try:
+        results = {
+            'whois': {},
+            'dns_records': {},
+            'ssl_info': {},
+            'tech_stack': [],
+            'subdomains': [],
+            'security_headers': {},
+            'leaked_emails': []
+        }
+        
+        # Ambil informasi WHOIS
+        try:
+            import whois
+            whois_info = whois.whois(domain)
+            results['whois'] = {
+                'registrar': whois_info.registrar,
+                'creation_date': whois_info.creation_date,
+                'expiration_date': whois_info.expiration_date,
+                'name_servers': whois_info.name_servers,
+                'status': whois_info.status,
+                'emails': whois_info.emails,
+                'org': whois_info.org
+            }
+        except Exception as e:
+            logger.error(f"WHOIS error: {str(e)}")
+            results['whois'] = {'error': str(e)}
+        
+        # Ambil DNS records
+        try:
+            import dns.resolver
+            for record_type in config.DNS_RECORD_TYPES:
+                try:
+                    answers = dns.resolver.resolve(domain, record_type)
+                    results['dns_records'][record_type] = [str(rdata) for rdata in answers]
+                except Exception:
+                    results['dns_records'][record_type] = []
+        except Exception as e:
+            logger.error(f"DNS error: {str(e)}")
+            results['dns_records'] = {'error': str(e)}
+        
+        # Cek SSL certificate
+        if config.SSL_CERT_CHECK:
+            try:
+                import ssl
+                import socket
+                context = ssl.create_default_context()
+                with context.wrap_socket(socket.socket(), server_hostname=domain) as sock:
+                    sock.connect((domain, 443))
+                    cert = sock.getpeercert()
+                    results['ssl_info'] = {
+                        'issuer': dict(x[0] for x in cert['issuer']),
+                        'subject': dict(x[0] for x in cert['subject']),
+                        'version': cert['version'],
+                        'serial_number': cert['serialNumber'],
+                        'not_before': cert['notBefore'],
+                        'not_after': cert['notAfter']
+                    }
+            except Exception as e:
+                logger.error(f"SSL error: {str(e)}")
+                results['ssl_info'] = {'error': str(e)}
+        
+        # Deteksi tech stack
+        if config.TECH_STACK_DETECTION:
+            try:
+                results['tech_stack'] = await check_tech_stack(f"https://{domain}")
+            except Exception as e:
+                logger.error(f"Tech stack detection error: {str(e)}")
+                results['tech_stack'] = []
+        
+        # Cari subdomain (basic)
+        try:
+            common_subdomains = ['www', 'mail', 'ftp', 'webmail', 'admin', 'test', 'dev', 'api']
+            found_subdomains = []
+            for sub in common_subdomains:
+                try:
+                    answers = dns.resolver.resolve(f"{sub}.{domain}", 'A')
+                    if answers:
+                        found_subdomains.append(f"{sub}.{domain}")
+                except:
+                    continue
+            results['subdomains'] = found_subdomains
+        except Exception as e:
+            logger.error(f"Subdomain enumeration error: {str(e)}")
+            results['subdomains'] = []
+        
+        # Cek security headers
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://{domain}", headers=config.SCRAPE_HEADERS) as response:
+                    headers = response.headers
+                    security_headers = {
+                        'X-XSS-Protection': headers.get('X-XSS-Protection', 'Not Set'),
+                        'X-Frame-Options': headers.get('X-Frame-Options', 'Not Set'),
+                        'X-Content-Type-Options': headers.get('X-Content-Type-Options', 'Not Set'),
+                        'Strict-Transport-Security': headers.get('Strict-Transport-Security', 'Not Set'),
+                        'Content-Security-Policy': headers.get('Content-Security-Policy', 'Not Set')
+                    }
+                    results['security_headers'] = security_headers
+        except Exception as e:
+            logger.error(f"Security headers check error: {str(e)}")
+            results['security_headers'] = {}
+        
+        # Cari email yang terkait
+        try:
+            leaked_emails = await find_leaked_emails(domain)
+            results['leaked_emails'] = leaked_emails[:10]  # Batasi ke 10 email
+        except Exception as e:
+            logger.error(f"Email finding error: {str(e)}")
+            results['leaked_emails'] = []
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"Domain analysis error: {str(e)}")
+        raise Exception(f"Gagal menganalisis domain: {str(e)}")
+
+def format_domain_results(results):
+    """Format hasil analisis domain untuk ditampilkan"""
+    text = "*🌐 DOMAIN INTELLIGENCE*\n\n"
+    
+    # WHOIS Info
+    if 'whois' in results and not 'error' in results['whois']:
+        text += "*📋 WHOIS Info:*\n"
+        whois = results['whois']
+        text += f"├─ Registrar: {whois.get('registrar', 'Unknown')}\n"
+        
+        # Format tanggal
+        creation_date = whois.get('creation_date')
+        if creation_date:
+            if isinstance(creation_date, list):
+                creation_date = creation_date[0]
+            text += f"├─ Dibuat: {creation_date}\n"
+        
+        expiration_date = whois.get('expiration_date')
+        if expiration_date:
+            if isinstance(expiration_date, list):
+                expiration_date = expiration_date[0]
+            text += f"├─ Kadaluarsa: {expiration_date}\n"
+        
+        if whois.get('org'):
+            text += f"├─ Organisasi: {whois['org']}\n"
+        
+        if whois.get('name_servers'):
+            ns = whois['name_servers']
+            if isinstance(ns, list):
+                ns = ns[:3]  # Ambil 3 nameserver pertama
+                text += f"└─ Nameservers: {', '.join(ns)}\n\n"
+            else:
+                text += f"└─ Nameserver: {ns}\n\n"
+        else:
+            text = text[:-1] + "└" + text[-1] + "\n\n"
+    
+    # DNS Records
+    if 'dns_records' in results and not 'error' in results['dns_records']:
+        text += "*🔍 DNS Records:*\n"
+        for record_type, records in results['dns_records'].items():
+            if records:
+                text += f"*{record_type} Records:*\n"
+                for record in records[:3]:  # Batasi 3 record per tipe
+                    text += f"├─ {record}\n"
+                if len(records) > 3:
+                    text += f"└─ ...dan {len(records)-3} record lainnya\n"
+                else:
+                    text = text[:-1] + "└" + text[-1] + "\n"
+        text += "\n"
+    
+    # SSL Info
+    if 'ssl_info' in results and not 'error' in results['ssl_info']:
+        text += "*🔒 SSL Certificate:*\n"
+        ssl = results['ssl_info']
+        if 'issuer' in ssl:
+            text += f"├─ Issuer: {ssl['issuer'].get('O', 'Unknown')}\n"
+        if 'not_before' in ssl and 'not_after' in ssl:
+            text += f"├─ Valid: {ssl['not_before']} to {ssl['not_after']}\n"
+        if 'version' in ssl:
+            text += f"└─ Version: {ssl['version']}\n\n"
+    
+    # Tech Stack
+    if 'tech_stack' in results and results['tech_stack']:
+        text += "*💻 Technology Stack:*\n"
+        for tech in results['tech_stack'][:10]:
+            text += f"├─ {tech}\n"
+        if len(results['tech_stack']) > 10:
+            text += f"└─ ...dan {len(results['tech_stack'])-10} teknologi lainnya\n\n"
+        else:
+            text = text[:-1] + "└" + text[-1] + "\n\n"
+    
+    # Subdomain
+    if 'subdomains' in results and results['subdomains']:
+        text += "*🌍 Subdomain:*\n"
+        for sub in results['subdomains'][:5]:
+            text += f"├─ {sub}\n"
+        if len(results['subdomains']) > 5:
+            text += f"└─ ...dan {len(results['subdomains'])-5} subdomain lainnya\n\n"
+        else:
+            text = text[:-1] + "└" + text[-1] + "\n\n"
+    
+    # Security Headers
+    if 'security_headers' in results and results['security_headers']:
+        text += "*🛡️ Security Headers:*\n"
+        headers = results['security_headers']
+        for header, value in headers.items():
+            if value != 'Not Set':
+                text += f"├─ {header}: ✅\n"
+            else:
+                text += f"├─ {header}: ❌\n"
+        text = text[:-1] + "└" + text[-1] + "\n\n"
+    
+    # Leaked Emails
+    if 'leaked_emails' in results and results['leaked_emails']:
+        text += "*📧 Email Terkait:*\n"
+        for email in results['leaked_emails'][:5]:
+            text += f"├─ {email}\n"
+        if len(results['leaked_emails']) > 5:
+            text += f"└─ ...dan {len(results['leaked_emails'])-5} email lainnya\n"
+        else:
+            text = text[:-1] + "└" + text[-1]
+    
+    return text
+
+if __name__ == "__main__":
+    main()

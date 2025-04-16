@@ -2,16 +2,16 @@
 # Simpen semua konfigurasi di sini, biar gampang diedit
 
 # Token bot dari BotFather
-TELEGRAM_TOKEN = "8060807216:AAFP5YfplKMBRUiyOE4IyCN38lljpsHfL8U"
+TELEGRAM_TOKEN = ""
 
 # API Keys
-HUNTER_IO_API_KEY = "a823ef89d105b7f96b2da147b86e6ac6a5af53a3"
+HUNTER_IO_API_KEY = ""
 HIBP_API_KEY = ""  # Have I Been Pwned API key
-DEHASHED_API_KEY = "1SqO68Wy/yl+iZyy7xEGOSb5pPPm3i6JxZB0DqZ4ApoBI/VYjQBbJkU="  # DeHashed API key
+DEHASHED_API_KEY = ""  # DeHashed API key
 EMAILREP_API_KEY = ""  # EmailRep API key
-SHODAN_API_KEY = "ANlvIaZOvzFAoGF6Dp2DumrfBpYvLOhA"  # Shodan API key
-ABUSEIPDB_API_KEY = "d9074b4fb9f72a6f03fb9b36c2b43bf843bdeeceb2ebe0d2cc36f58a01f4b72c9e1eddff1c449ce2"  # AbuseIPDB API key
-NUMVERIFY_API_KEY = "cebbe5931bcbf9ef23d549277b9c54bb"  # NumVerify API key untuk tracking lokasi realtime
+SHODAN_API_KEY = ""  # Shodan API key
+ABUSEIPDB_API_KEY = ""  # AbuseIPDB API key
+NUMVERIFY_API_KEY = ""  # NumVerify API key untuk tracking lokasi realtime
 CENSYS_API_ID = ""  # Censys API ID
 CENSYS_API_SECRET = ""  # Censys API Secret
 WAPPALYZER_API_KEY = ""  # Wappalyzer API key
@@ -26,16 +26,16 @@ GITHUB_API_TOKEN = None  # Ganti dengan token GitHub Anda
 INSTAGRAM_API_KEY = None  # Ganti dengan API key Instagram Anda
 INSTAGRAM_APP_SECRET = ""  # Instagram App Secret
 
-LINKEDIN_API_KEY = "86gbjxj5pms4fk"  # LinkedIn API Key
-LINKEDIN_API_SECRET = "WPL_AP1.HyE9cH7vuxHxHspw.0mBTIQ=="  # LinkedIn API Secret
+LINKEDIN_API_KEY = ""  # LinkedIn API Key
+LINKEDIN_API_SECRET = ""  # LinkedIn API Secret
 
-FACEBOOK_APP_ID = "2189242424856433"  # Facebook App ID
-FACEBOOK_APP_SECRET = "73e5e782fc225beccfbed2e0a4261ff9"  # Facebook App Secret
+FACEBOOK_APP_ID = ""  # Facebook App ID
+FACEBOOK_APP_SECRET = ""  # Facebook App Secret
 
 YOUTUBE_API_KEY = None  # Ganti dengan API key YouTube Anda
 
-TIKTOK_API_KEY = "awnlfc8j9dmhkxun"  # TikTok API Key
-TIKTOK_API_SECRET = "tSuSEcfYbZCLcvo4sZerR1aRiaq6lKln"  # TikTok API Secret
+TIKTOK_API_KEY = ""  # TikTok API Key
+TIKTOK_API_SECRET = ""  # TikTok API Secret
 
 REDDIT_CLIENT_ID = None  # Ganti dengan client ID Reddit Anda
 REDDIT_CLIENT_SECRET = None  # Ganti dengan client secret Reddit Anda
